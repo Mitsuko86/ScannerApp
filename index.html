@@ -75,6 +75,8 @@
   <strong>List loaded:</strong> <span id="count">0</span> ISBNs<br><br>
   <input id="file" type="file" accept=".txt,.csv" />
   <div class="muted">Tip: one ISBN per line is best. ISBN-10 is normalized to ISBN-13 for matching. Dashes/spaces are OK.</div>
+  <div id="persistStatus" class="muted"></div>
+  <button type="button" id="clearSaved">Clear saved list</button>
 </div>
 
 <div class="card">
@@ -122,8 +124,47 @@
 <!-- OCR library -->
 <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
 
-<!-- Main app logic -->
 <script>
+/* ===== Persistence (localStorage) ===== */
+const LS_KEY = "media_sniper_isbn13_list_v1"; // stored as newline-separated isbn13
+const LS_TS  = "media_sniper_isbn13_list_ts_v1";
+
+function setPersistStatus(msg){
+  document.getElementById("persistStatus").textContent = msg || "";
+}
+
+function saveListToLocalStorage(set){
+  try{
+    const arr = Array.from(set);
+    localStorage.setItem(LS_KEY, arr.join("\n"));
+    localStorage.setItem(LS_TS, String(Date.now()));
+    setPersistStatus(`Saved list on device (${arr.length} ISBNs).`);
+  } catch(e){
+    setPersistStatus("Could not save list (storage blocked or full).");
+  }
+}
+
+function loadListFromLocalStorage(){
+  try{
+    const raw = localStorage.getItem(LS_KEY);
+    if(!raw) return null;
+    const lines = raw.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+    if(!lines.length) return null;
+    return new Set(lines);
+  } catch(e){
+    return null;
+  }
+}
+
+function clearSavedList(){
+  try{
+    localStorage.removeItem(LS_KEY);
+    localStorage.removeItem(LS_TS);
+  } catch(_) {}
+  setPersistStatus("Saved list cleared.");
+}
+
+/* ===== App state ===== */
 let isbnSet = new Set();
 let lastScanned = null;
 let lastScannedIsbn13 = null;
@@ -136,7 +177,6 @@ let ocrWorker = null;
 let ocrReady = false;
 
 function cleanDigits(s){
-  // Keeps digits and X. Removes dashes/spaces/letters.
   return (s || "").replace(/[^0-9Xx]/g, "").toUpperCase();
 }
 
@@ -200,14 +240,12 @@ function beep(){
   setTimeout(() => osc.stop(), 120);
 }
 
-// Vibration: iPhone Safari often ignores this. Android usually works.
 function vibrateSuccess(){
   try {
     if (navigator.vibrate) navigator.vibrate([100, 50, 100]);
   } catch (_) {}
 }
 
-// Background state: green stays until next scan
 function setMatchState(isMatch){
   document.body.classList.remove("matchState");
   if(isMatch) document.body.classList.add("matchState");
@@ -234,11 +272,19 @@ document.getElementById("file").addEventListener("change", async (e) => {
   });
 
   document.getElementById("count").textContent = isbnSet.size;
+  setPersistStatus("");
+  saveListToLocalStorage(isbnSet);
+
   document.getElementById("scan").focus();
 });
 
+document.getElementById("clearSaved").addEventListener("click", () => {
+  clearSavedList();
+  isbnSet = new Set();
+  document.getElementById("count").textContent = "0";
+});
+
 function handleScan(value){
-  // value can include dashes/spaces; normalize handles that
   const norm13 = normalizeToIsbn13(value);
 
   lastScanned = value;
@@ -297,40 +343,31 @@ function openEbayLiveLow(){
 }
 
 function openKeepaGtin(){
-  // Keepa GTIN search works best with 13-digit.
-  // If we only have ISBN-10, we convert it to ISBN-13.
   const gtin = lastScannedIsbn13 || normalizeToIsbn13(lastScanned || "");
   if(!gtin) return;
 
-  // Keepa may require login.
   const url = `https://keepa.com/#!search/1-${encodeURIComponent(gtin)}`;
   window.open(url, "_blank");
 }
 
 /* ===== OCR helpers ===== */
-
 function setOcrStatus(msg){
   document.getElementById("ocrStatus").textContent = msg || "";
 }
 
 function extractIsbnCandidates(text){
-  const t = (text || "").replace(/\u00ad/g, "-"); // soft hyphen cleanup
-
-  // Prefer lines containing ISBN
+  const t = (text || "").replace(/\u00ad/g, "-");
   const lines = t.split(/\r?\n/);
   const isbnLines = lines.filter(line => /isbn/i.test(line));
   const searchText = isbnLines.length ? isbnLines.join("\n") : t;
 
   const candidates = [];
-
-  // ISBN-13 candidates starting with 978/979 with separators
   const re13 = /(97[89][0-9\-\s]{10,22}[0-9])/g;
   let m;
   while((m = re13.exec(searchText)) !== null){
     candidates.push(m[1]);
   }
 
-  // ISBN-10-ish candidates (last can be X)
   const re10 = /([0-9][0-9\-\s]{8,18}[0-9Xx])/g;
   while((m = re10.exec(searchText)) !== null){
     candidates.push(m[1]);
@@ -361,7 +398,6 @@ function pickBestIsbn(cands){
 
 async function ensureOcrWorker(){
   if(ocrReady && ocrWorker) return;
-
   if(!window.Tesseract) throw new Error("Tesseract not loaded.");
 
   setOcrStatus("OCR: loading engine (first time can take a bit) ...");
@@ -385,7 +421,6 @@ async function ensureOcrWorker(){
   setOcrStatus("OCR: ready");
 }
 
-/* OCR UI wiring */
 const ocrBtn = document.getElementById("ocrBtn");
 const ocrInput = document.getElementById("ocrInput");
 
@@ -402,7 +437,7 @@ ocrInput.addEventListener("change", async (e) => {
   try{
     await ensureOcrWorker();
 
-    // Pass 1 (general)
+    // Pass 1
     setOcrStatus("OCR: reading photo (pass 1) ...");
     await ocrWorker.setParameters({
       tessedit_char_whitelist: "0123456789Xx- ISBNisbn",
@@ -415,10 +450,9 @@ ocrInput.addEventListener("change", async (e) => {
     let candidates = extractIsbnCandidates(text);
     let best = pickBestIsbn(candidates);
 
-    // Pass 2 (more strict) only if pass 1 did not find anything
+    // Pass 2 if needed
     if(!best){
       setOcrStatus("OCR: no clear ISBN found, trying pass 2 ...");
-
       await ocrWorker.setParameters({
         tessedit_char_whitelist: "0123456789Xx-ISBNisbn",
         preserve_interword_spaces: "1",
@@ -448,6 +482,25 @@ ocrInput.addEventListener("change", async (e) => {
     setOcrStatus("OCR: failed. Try again with better lighting, or a closer crop of the ISBN line.");
   }
 });
+
+/* ===== Restore saved list on load ===== */
+(function restoreListOnStartup(){
+  const saved = loadListFromLocalStorage();
+  if(saved && saved.size){
+    isbnSet = saved;
+    document.getElementById("count").textContent = String(isbnSet.size);
+
+    const ts = localStorage.getItem(LS_TS);
+    if(ts){
+      const d = new Date(parseInt(ts, 10));
+      setPersistStatus(`Using saved list from ${d.toLocaleString()}.`);
+    } else {
+      setPersistStatus("Using saved list on device.");
+    }
+  } else {
+    setPersistStatus("No saved list yet. Import your list once and it will stay on device.");
+  }
+})();
 </script>
 
 <!-- Camera barcode scanning (ZXing) -->
