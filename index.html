@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Media Sniper Scanner</title>
+<style>
+body { font-family: -apple-system, system-ui, sans-serif; margin: 16px; }
+.card { border: 1px solid #ddd; border-radius: 12px; padding: 14px; margin-bottom: 12px; }
+input[type="text"] { width: 100%; font-size: 22px; padding: 12px; border-radius: 10px; border: 1px solid #bbb; }
+button { font-size: 16px; padding: 10px 12px; border-radius: 10px; border: 1px solid #888; background: #f5f5f5; margin-right: 6px; margin-top:6px;}
+.okFlash { background: #d9ffd9 !important; }
+.badFlash { background: #ffe3e3 !important; }
+ul { margin: 8px 0 0; padding-left: 18px; }
+</style>
+</head>
+<body>
+
+<h2>Media Sniper Scanner</h2>
+
+<div class="card">
+  <strong>List loaded:</strong> <span id="count">0</span> ISBNs<br><br>
+  <input id="file" type="file" accept=".txt,.csv" />
+</div>
+
+<div class="card">
+  <input id="scan" type="text" placeholder="Scan ISBN..." autocomplete="off" />
+  <br><br>
+  <button id="enableSound">Enable sound</button>
+  <br><br>
+  <button onclick="openEbaySoldHigh()">eBay Sold (High → Low)</button>
+  <button onclick="openEbayLiveLow()">eBay Live (Low → High)</button>
+</div>
+
+<div class="card">
+  <strong>Last scans</strong>
+  <ul id="recent"></ul>
+</div>
+
+<script>
+let isbnSet = new Set();
+let lastScanned = null;
+let audioCtx = null;
+let soundReady = false;
+
+function cleanDigits(s){
+  return (s||"").replace(/[^0-9Xx]/g,"").toUpperCase();
+}
+
+function isbn10to13(isbn10){
+  const core9 = isbn10.slice(0,9);
+  if(!/^\d{9}$/.test(core9)) return null;
+  const base12 = "978"+core9;
+  let sum=0;
+  for(let i=0;i<12;i++){
+    const d = parseInt(base12[i]);
+    sum += (i%2===0)? d : 3*d;
+  }
+  const check=(10-(sum%10))%10;
+  return base12+check;
+}
+
+function normalizeToIsbn13(raw){
+  const s = cleanDigits(raw);
+  if(/^\d{13}$/.test(s)) return s;
+  if(/^\d{10}$/.test(s) || /^\d{9}X$/.test(s)){
+    return isbn10to13(s);
+  }
+  return null;
+}
+
+function beep(){
+  if(!soundReady || !audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type="square";
+  osc.frequency.value=880;
+  gain.gain.value=0.15;
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  setTimeout(()=>osc.stop(),120);
+}
+
+document.getElementById("enableSound").onclick = async ()=>{
+  audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+  await audioCtx.resume();
+  soundReady=true;
+  document.getElementById("scan").focus();
+};
+
+document.getElementById("file").addEventListener("change", async (e)=>{
+  const file=e.target.files[0];
+  if(!file) return;
+  const text=await file.text();
+  const lines=text.split(/\r?\n/);
+  isbnSet=new Set();
+  lines.forEach(line=>{
+    const n=normalizeToIsbn13(line.trim());
+    if(n) isbnSet.add(n);
+  });
+  document.getElementById("count").textContent=isbnSet.size;
+  document.getElementById("scan").focus();
+});
+
+function flash(isMatch){
+  document.body.classList.remove("okFlash","badFlash");
+  document.body.classList.add(isMatch?"okFlash":"badFlash");
+  setTimeout(()=>document.body.classList.remove("okFlash","badFlash"),150);
+}
+
+function handleScan(value){
+  const norm=normalizeToIsbn13(value);
+  lastScanned = norm || value;
+  const isMatch = norm && isbnSet.has(norm);
+
+  if(isMatch){
+    flash(true);
+    beep();
+  } else {
+    flash(false);
+  }
+
+  const li=document.createElement("li");
+  li.textContent=value + (isMatch?"  MATCH":"");
+  const list=document.getElementById("recent");
+  list.prepend(li);
+  while(list.children.length>10) list.removeChild(list.lastChild);
+
+  document.getElementById("scan").value="";
+}
+
+let timer=null;
+document.getElementById("scan").addEventListener("input", ()=>{
+  clearTimeout(timer);
+  timer=setTimeout(()=>{
+    const val=document.getElementById("scan").value.trim();
+    if(val) handleScan(val);
+  },180);
+});
+
+document.getElementById("scan").addEventListener("keydown",(e)=>{
+  if(e.key==="Enter"){
+    e.preventDefault();
+    const val=document.getElementById("scan").value.trim();
+    if(val) handleScan(val);
+  }
+});
+
+function openEbaySoldHigh(){
+  if(!lastScanned) return;
+  const q=encodeURIComponent(lastScanned);
+  const url=`https://www.ebay.ca/sch/i.html?_nkw=${q}&LH_Sold=1&LH_Complete=1&_sop=16`;
+  window.open(url,"_blank");
+}
+
+function openEbayLiveLow(){
+  if(!lastScanned) return;
+  const q=encodeURIComponent(lastScanned);
+  const url=`https://www.ebay.ca/sch/i.html?_nkw=${q}&_sop=15`;
+  window.open(url,"_blank");
+}
+</script>
+</body>
+</html>
