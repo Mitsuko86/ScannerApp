@@ -10,11 +10,28 @@
   input[type="text"] { width: 100%; font-size: 22px; padding: 12px; border-radius: 10px; border: 1px solid #bbb; }
   button { font-size: 16px; padding: 10px 12px; border-radius: 10px; border: 1px solid #888; background: #f5f5f5; margin-right: 6px; margin-top: 6px; }
   ul { margin: 8px 0 0; padding-left: 18px; }
+  .muted { color:#666; font-size: 13px; margin-top: 6px; line-height: 1.35; }
 
-  /* Match background state: stays green until next scan */
+  /* Match background state: stays green until next scan changes state */
   .matchState {
     background-color: #c6f7c6;
     transition: background-color 0.25s ease;
+  }
+
+  video {
+    width: 100%;
+    max-width: 520px;
+    border-radius: 12px;
+    border: 1px solid #ddd;
+    display: none;
+    margin-top: 10px;
+  }
+
+  .statusLine {
+    margin-top: 8px;
+    font-size: 13px;
+    color: #444;
+    white-space: pre-wrap;
   }
 </style>
 </head>
@@ -25,15 +42,39 @@
 <div class="card">
   <strong>List loaded:</strong> <span id="count">0</span> ISBNs<br><br>
   <input id="file" type="file" accept=".txt,.csv" />
+  <div class="muted">Tip: one ISBN per line is best. ISBN-10 is normalized to ISBN-13 for matching.</div>
 </div>
 
 <div class="card">
   <input id="scan" type="text" placeholder="Scan ISBN..." autocomplete="off" />
   <br><br>
-  <button id="enableSound">Enable sound</button>
-  <br><br>
-  <button onclick="openEbaySoldHigh()">eBay Sold (High → Low)</button>
-  <button onclick="openEbayLiveLow()">eBay Live (Low → High)</button>
+
+  <button id="enableSound" type="button">Enable sound</button>
+  <div class="muted">On iPhone, tap this once so the beep can play.</div>
+
+  <div style="margin-top:10px;">
+    <button type="button" onclick="openEbaySoldHigh()">eBay Sold (High to Low)</button>
+    <button type="button" onclick="openEbayLiveLow()">eBay Live (Low to High)</button>
+  </div>
+
+  <div style="margin-top:10px;">
+    <button type="button" id="startCam">Camera scan (barcode)</button>
+    <button type="button" id="stopCam" disabled>Stop camera</button>
+    <div class="muted">Best for barcodes (EAN/UPC). Fastest option.</div>
+  </div>
+
+  <div style="margin-top:10px;">
+    <button type="button" id="ocrBtn">Scan printed ISBN (photo)</button>
+    <div class="muted">For older books with no barcode. Take a photo of the ISBN line on the copyright page. OCR takes a few seconds.</div>
+  </div>
+
+  <!-- Hidden file input to open camera -->
+  <input id="ocrInput" type="file" accept="image/*" capture="environment" style="display:none;" />
+
+  <video id="preview" playsinline></video>
+  <div id="camStatus" class="muted"></div>
+
+  <div id="ocrStatus" class="statusLine"></div>
 </div>
 
 <div class="card">
@@ -41,11 +82,16 @@
   <ul id="recent"></ul>
 </div>
 
+<!-- Main app logic -->
 <script>
 let isbnSet = new Set();
 let lastScanned = null;
 let audioCtx = null;
 let soundReady = false;
+
+// OCR worker cache
+let ocrWorker = null;
+let ocrReady = false;
 
 function cleanDigits(s){
   return (s||"").replace(/[^0-9Xx]/g,"").toUpperCase();
@@ -87,19 +133,16 @@ function beep(){
 }
 
 // Vibration: iPhone Safari often ignores this, Android usually works.
-// Safe to call either way.
 function vibrateSuccess(){
   try {
     if (navigator.vibrate) navigator.vibrate([100, 50, 100]);
   } catch (_) {}
 }
 
-// Match background state: green stays until next scan changes state
+// Background state: green stays until next scan
 function setMatchState(isMatch){
   document.body.classList.remove("matchState");
-  if(isMatch){
-    document.body.classList.add("matchState");
-  }
+  if(isMatch) document.body.classList.add("matchState");
 }
 
 document.getElementById("enableSound").onclick = async ()=>{
@@ -131,7 +174,6 @@ function handleScan(value){
   lastScanned = norm || value;
   const isMatch = !!(norm && isbnSet.has(norm));
 
-  // Update background state (green stays until next scan)
   setMatchState(isMatch);
 
   if(isMatch){
@@ -178,6 +220,245 @@ function openEbayLiveLow(){
   const url = `https://www.ebay.ca/sch/i.html?_nkw=${q}&_sop=15`;
   window.open(url, "_blank");
 }
+
+/* ===== OCR helpers ===== */
+
+function setOcrStatus(msg){
+  document.getElementById("ocrStatus").textContent = msg || "";
+}
+
+// Extract ISBN candidates from OCR text.
+// We accept messy formats like:
+// "ISBN 0-123-45678-9" or "ISBN 978-1-2345-6789-0"
+function extractIsbnCandidates(text){
+  const t = (text || "").replace(/\u00ad/g, "-"); // soft hyphen cleanup
+
+  // Prefer lines containing "ISBN"
+  const isbnLines = t.split(/\r?\n/).filter(line => /isbn/i.test(line));
+  const searchText = isbnLines.length ? isbnLines.join("\n") : t;
+
+  const candidates = [];
+
+  // Find potential ISBN-13 patterns (978/979) with separators
+  const re13 = /(97[89][0-9\-\s]{10,20}[0-9])/g;
+  let m;
+  while((m = re13.exec(searchText)) !== null){
+    candidates.push(m[1]);
+  }
+
+  // Find potential ISBN-10 patterns with separators, last digit can be X
+  const re10 = /([0-9][0-9\-\s]{8,15}[0-9Xx])/g;
+  while((m = re10.exec(searchText)) !== null){
+    candidates.push(m[1]);
+  }
+
+  // Clean candidates down to digits/X only
+  const cleaned = candidates
+    .map(c => c.replace(/[^0-9Xx]/g, "").toUpperCase())
+    .filter(c => c.length === 10 || c.length === 13);
+
+  // Deduplicate, keep order
+  return [...new Set(cleaned)];
+}
+
+// Simple ISBN-10 check digit validation (helps avoid OCR junk)
+function isValidIsbn10(isbn10){
+  const s = cleanDigits(isbn10);
+  if(!/^\d{9}[\dX]$/.test(s)) return false;
+
+  let sum = 0;
+  for(let i=0;i<9;i++){
+    sum += (10 - i) * parseInt(s[i], 10);
+  }
+  const last = s[9] === "X" ? 10 : parseInt(s[9], 10);
+  sum += last;
+  return (sum % 11) === 0;
+}
+
+function isValidIsbn13(isbn13){
+  const s = cleanDigits(isbn13);
+  if(!/^\d{13}$/.test(s)) return false;
+  let sum = 0;
+  for(let i=0;i<12;i++){
+    const d = parseInt(s[i], 10);
+    sum += (i % 2 === 0) ? d : 3*d;
+  }
+  const check = (10 - (sum % 10)) % 10;
+  return check === parseInt(s[12], 10);
+}
+
+function pickBestIsbn(cands){
+  // First: valid ISBN-13
+  for(const c of cands){
+    if(c.length === 13 && isValidIsbn13(c)) return c;
+  }
+  // Next: valid ISBN-10
+  for(const c of cands){
+    if(c.length === 10 && isValidIsbn10(c)) return c;
+  }
+  // Fallback: any 13 then any 10
+  for(const c of cands){
+    if(c.length === 13) return c;
+  }
+  for(const c of cands){
+    if(c.length === 10) return c;
+  }
+  return null;
+}
+
+// Initialize Tesseract worker on demand
+async function ensureOcrWorker(){
+  if(ocrReady && ocrWorker) return;
+
+  if(!window.Tesseract){
+    throw new Error("Tesseract library not loaded.");
+  }
+
+  setOcrStatus("OCR: loading engine (first time can take a bit) ...");
+
+  ocrWorker = await window.Tesseract.createWorker("eng", 1, {
+    logger: (m) => {
+      if(m && m.status){
+        const pct = (m.progress != null) ? Math.round(m.progress * 100) : null;
+        if(pct != null){
+          setOcrStatus(`OCR: ${m.status} (${pct}%)`);
+        } else {
+          setOcrStatus(`OCR: ${m.status}`);
+        }
+      }
+    }
+  });
+
+  // Help OCR focus on ISBN-like characters
+  // Note: too strict can hurt accuracy, so we keep it modest.
+  await ocrWorker.setParameters({
+    tessedit_char_whitelist: "0123456789Xx- ISBNisbn",
+    preserve_interword_spaces: "1"
+  });
+
+  ocrReady = true;
+  setOcrStatus("OCR: ready");
+}
+
+/* OCR UI wiring */
+const ocrBtn = document.getElementById("ocrBtn");
+const ocrInput = document.getElementById("ocrInput");
+
+ocrBtn.addEventListener("click", async () => {
+  try{
+    // Pre-load worker if you want slightly faster after photo
+    // Comment out next line if you prefer instant camera open.
+    await ensureOcrWorker();
+  } catch(_) {
+    // Ignore preload failure, we will try again after photo
+  }
+  ocrInput.value = "";
+  ocrInput.click();
+});
+
+ocrInput.addEventListener("change", async (e) => {
+  const file = e.target.files && e.target.files[0];
+  if(!file) return;
+
+  try{
+    await ensureOcrWorker();
+
+    setOcrStatus("OCR: reading photo ...");
+
+    const res = await ocrWorker.recognize(file);
+    const text = (res && res.data && res.data.text) ? res.data.text : "";
+
+    const candidates = extractIsbnCandidates(text);
+    const best = pickBestIsbn(candidates);
+
+    if(!best){
+      setOcrStatus("OCR: could not find a clear ISBN. Try closer photo of the ISBN line only, with good light.");
+      return;
+    }
+
+    setOcrStatus(`OCR: found ${best}. Checking...`);
+
+    // Feed into your normal flow
+    handleScan(best);
+
+    // Put focus back for Bluetooth scanning
+    const scanEl = document.getElementById("scan");
+    if(scanEl) scanEl.focus();
+
+  } catch(err){
+    console.error(err);
+    setOcrStatus("OCR: failed. Try again with better lighting, or a closer crop of the ISBN line.");
+  }
+});
 </script>
+
+<!-- Camera barcode scanning (ZXing) -->
+<script type="module">
+  import { BrowserMultiFormatReader } from "https://unpkg.com/@zxing/browser@0.1.5/esm/index.min.js";
+
+  const startBtn = document.getElementById("startCam");
+  const stopBtn = document.getElementById("stopCam");
+  const videoEl = document.getElementById("preview");
+  const statusEl = document.getElementById("camStatus");
+
+  let codeReader = null;
+  let controls = null;
+
+  function setStatus(msg){ statusEl.textContent = msg || ""; }
+
+  async function startCameraScan(){
+    try{
+      setStatus("Requesting camera permission...");
+      startBtn.disabled = true;
+
+      videoEl.style.display = "block";
+      codeReader = new BrowserMultiFormatReader();
+
+      const constraints = { video: { facingMode: "environment" }, audio: false };
+
+      controls = await codeReader.decodeFromConstraints(constraints, videoEl, (result, err) => {
+        if(result){
+          const text = result.getText();
+
+          stopCameraScan();
+
+          handleScan(text);
+
+          setStatus("Scanned: " + text);
+        }
+      });
+
+      stopBtn.disabled = false;
+      setStatus("Scanning... aim at the barcode.");
+    } catch(e){
+      console.error(e);
+      setStatus("Camera failed. Check iPhone Settings > Safari > Camera (Allow).");
+      videoEl.style.display = "none";
+      startBtn.disabled = false;
+    }
+  }
+
+  function stopCameraScan(){
+    try { if(controls) controls.stop(); } catch(_) {}
+    try { if(codeReader) codeReader.reset(); } catch(_) {}
+
+    controls = null;
+    codeReader = null;
+
+    videoEl.style.display = "none";
+    stopBtn.disabled = true;
+    startBtn.disabled = false;
+
+    const scanEl = document.getElementById("scan");
+    if(scanEl) scanEl.focus();
+  }
+
+  startBtn.addEventListener("click", startCameraScan);
+  stopBtn.addEventListener("click", stopCameraScan);
+</script>
+
+<!-- OCR library -->
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+
 </body>
 </html>
