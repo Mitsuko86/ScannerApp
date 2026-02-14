@@ -97,7 +97,7 @@
 <div class="card">
   <strong>Amazon approved list loaded:</strong> <span id="countAmazon">0</span> ISBNs<br><br>
   <input id="fileAmazon" type="file" accept=".txt,.csv" />
-  <div class="muted">This is your Keepa-generated “consignment OK” ISBN list (978...). Same matching behavior as eBay list.</div>
+  <div class="muted">This is your Keepa-generated consignment OK list (978...). Same matching behavior as eBay list.</div>
   <div id="persistStatusAmazon" class="muted"></div>
   <button type="button" id="clearSavedAmazon">Clear saved Amazon list</button>
 </div>
@@ -147,6 +147,19 @@
 </div>
 
 <div class="card">
+  <strong>Accept log</strong>
+  <div class="muted">Stores BUY decisions on this device (BUY only) so you can export later.</div>
+
+  <div style="margin-top:10px;">
+    <button type="button" id="exportAccepts">Export CSV</button>
+    <button type="button" id="clearAccepts">Clear log</button>
+  </div>
+
+  <div class="muted" id="acceptCount"></div>
+  <ul id="acceptList"></ul>
+</div>
+
+<div class="card">
   <strong>Last scans</strong>
   <ul id="recent"></ul>
 </div>
@@ -160,6 +173,7 @@ const LS_EBAY_TS  = "media_sniper_ebay_isbn13_list_ts_v1";
 const LS_AMZ = "media_sniper_amazon_isbn13_list_v1";
 const LS_AMZ_TS  = "media_sniper_amazon_isbn13_list_ts_v1";
 const LS_WORKER = "media_sniper_booksrun_worker_url_v1";
+const LS_ACCEPTS = "media_sniper_accepts_v1";
 
 function setPersistStatusEbay(msg){ document.getElementById("persistStatusEbay").textContent = msg || ""; }
 function setPersistStatusAmazon(msg){ document.getElementById("persistStatusAmazon").textContent = msg || ""; }
@@ -208,6 +222,125 @@ function saveWorkerUrl(url){
 function loadWorkerUrl(){
   try { return localStorage.getItem(LS_WORKER) || ""; } catch(_) { return ""; }
 }
+
+/* ===== Accept log ===== */
+function loadAccepts(){
+  try {
+    const raw = localStorage.getItem(LS_ACCEPTS);
+    if(!raw) return [];
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr : [];
+  } catch(_) {
+    return [];
+  }
+}
+
+function saveAccepts(arr){
+  try {
+    localStorage.setItem(LS_ACCEPTS, JSON.stringify(arr));
+  } catch(_) {}
+}
+
+let accepts = loadAccepts();
+
+function renderAccepts(){
+  const elCount = document.getElementById("acceptCount");
+  const elList = document.getElementById("acceptList");
+  if(!elCount || !elList) return;
+
+  elCount.textContent = `Saved accepts: ${accepts.length}`;
+  elList.innerHTML = "";
+
+  const slice = accepts.slice(-20).reverse();
+  for(const a of slice){
+    const avg = (typeof a.booksrunAvgUsd === "number" && !Number.isNaN(a.booksrunAvgUsd))
+      ? `$${a.booksrunAvgUsd.toFixed(2)}`
+      : "N/A";
+
+    const also = [];
+    if(a.alsoBuyback) also.push("also_buyback");
+    if(a.alsoAmazon) also.push("also_amazon");
+    const alsoStr = also.length ? ` | ${also.join(" ")}` : "";
+
+    const li = document.createElement("li");
+    li.textContent = `${a.timestampLocal} | ${a.lane} | ${a.isbn13} | Avg ${avg} | eBay ${a.ebayHit ? "Y" : "N"} | Amz ${a.amazonHit ? "Y" : "N"}${alsoStr}`;
+    elList.appendChild(li);
+  }
+}
+
+function addAccept(entry){
+  accepts.push(entry);
+  saveAccepts(accepts);
+  renderAccepts();
+}
+
+function downloadText(filename, text){
+  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function acceptsToCsv(rows){
+  const header = [
+    "timestamp_iso",
+    "timestamp_local",
+    "isbn13",
+    "lane",
+    "ebay_hit",
+    "amazon_hit",
+    "buyback_hit",
+    "also_buyback",
+    "also_amazon",
+    "booksrun_avg_usd",
+    "min_usd_threshold",
+    "booksrun_status",
+    "booksrun_message"
+  ];
+
+  const esc = (v) => {
+    const s = (v == null) ? "" : String(v);
+    if(/[",\n]/.test(s)) return `"${s.replace(/"/g,'""')}"`;
+    return s;
+  };
+
+  const lines = [header.join(",")];
+  for(const r of rows){
+    lines.push([
+      esc(r.timestampIso),
+      esc(r.timestampLocal),
+      esc(r.isbn13),
+      esc(r.lane),
+      esc(r.ebayHit ? "1" : "0"),
+      esc(r.amazonHit ? "1" : "0"),
+      esc(r.buybackHit ? "1" : "0"),
+      esc(r.alsoBuyback ? "1" : "0"),
+      esc(r.alsoAmazon ? "1" : "0"),
+      esc((typeof r.booksrunAvgUsd === "number" && !Number.isNaN(r.booksrunAvgUsd)) ? r.booksrunAvgUsd.toFixed(2) : ""),
+      esc(r.minUsdThreshold),
+      esc(r.booksrunStatus || ""),
+      esc(r.booksrunMessage || "")
+    ].join(","));
+  }
+  return lines.join("\n");
+}
+
+document.getElementById("exportAccepts").addEventListener("click", () => {
+  const csv = acceptsToCsv(accepts);
+  const ts = new Date().toISOString().slice(0,19).replace(/[:T]/g,"-");
+  downloadText(`accepts-${ts}.csv`, csv);
+});
+
+document.getElementById("clearAccepts").addEventListener("click", () => {
+  accepts = [];
+  try { localStorage.removeItem(LS_ACCEPTS); } catch(_) {}
+  renderAccepts();
+});
 
 /* ===== App state ===== */
 let ebaySet = new Set();
@@ -377,11 +510,6 @@ function escapeHtml(s){
 }
 
 function decideLane({ ebayHit, amazonHit, avgUsd }){
-  // Priority rules:
-  // 1) EBAY
-  // 2) BUYBACK (BooksRun avg >= threshold)
-  // 3) AMAZON
-  // else PASS
   const minUsd = parseFloat(document.getElementById("minUsd").value || "10");
   const hasAvg = (typeof avgUsd === "number") && !Number.isNaN(avgUsd);
   const buybackHit = !!(hasAvg && avgUsd >= minUsd);
@@ -402,6 +530,32 @@ function renderDecision({ isbn13, ebayHit, amazonHit, avgUsd, booksrunStatus, bo
   if(isBuy){
     beep();
     vibrateSuccess();
+  }
+
+  // Log BUY only, only after BooksRun is done loading
+  const isFinal = booksrunStatus && booksrunStatus !== "loading";
+  if(isFinal && isBuy && isbn13){
+    const now = new Date();
+    const minUsdThreshold = parseFloat(document.getElementById("minUsd").value || "10");
+
+    const alsoBuyback = (lane === "EBAY") && !!buybackHit;
+    const alsoAmazon  = (lane === "EBAY" || lane === "BUYBACK") && !!amazonHit;
+
+    addAccept({
+      timestampIso: now.toISOString(),
+      timestampLocal: now.toLocaleString(),
+      isbn13,
+      lane,
+      ebayHit: !!ebayHit,
+      amazonHit: !!amazonHit,
+      buybackHit: !!buybackHit,
+      alsoBuyback,
+      alsoAmazon,
+      booksrunAvgUsd: (typeof avgUsd === "number" ? avgUsd : null),
+      minUsdThreshold,
+      booksrunStatus,
+      booksrunMessage: booksrunMsg || ""
+    });
   }
 
   const decisionBox = document.getElementById("decisionBox");
@@ -505,7 +659,6 @@ async function handleScan(value){
   // Render immediately while BooksRun loads
   renderDecision({ isbn13: norm13, ebayHit, amazonHit, avgUsd: null, booksrunStatus: "loading", booksrunMsg: "Checking BooksRun..." });
 
-  // Then call BooksRun and re-render so BUYBACK can override AMAZON if no EBAY
   const br = await fetchBooksRunAverage(norm13);
 
   renderDecision({
@@ -735,10 +888,10 @@ ocrInput.addEventListener("change", async (e) => {
     setWorkerStatus("Paste your Worker URL and Save it.");
   }
 
+  renderAccepts();
   setLaneState("PASS");
 })();
 </script>
 
 </body>
 </html>
-
