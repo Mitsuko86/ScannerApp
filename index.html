@@ -7,16 +7,16 @@
 <style>
   body { font-family: -apple-system, system-ui, sans-serif; margin: 16px; }
   .card { border: 1px solid #ddd; border-radius: 12px; padding: 14px; margin-bottom: 12px; background: white; }
-  input[type="text"] { width: 100%; font-size: 22px; padding: 12px; border-radius: 10px; border: 1px solid #bbb; }
+  input[type="text"], input[type="number"] { width: 100%; font-size: 22px; padding: 12px; border-radius: 10px; border: 1px solid #bbb; }
   button { font-size: 16px; padding: 10px 12px; border-radius: 10px; border: 1px solid #888; background: #f5f5f5; margin-right: 6px; margin-top: 6px; }
   ul { margin: 8px 0 0; padding-left: 18px; }
   .muted { color:#666; font-size: 13px; margin-top: 6px; line-height: 1.35; }
 
-  /* Match background state: stays green until next scan changes state */
-  .matchState {
-    background-color: #c6f7c6;
-    transition: background-color 0.25s ease;
-  }
+  /* GREEN state stays until next scan */
+  .matchState { background-color: #c6f7c6; transition: background-color 0.25s ease; }
+
+  /* Optional red hint panel */
+  .redHint { background-color: #ffd6d6; transition: background-color 0.25s ease; }
 
   video {
     width: 100%;
@@ -33,6 +33,18 @@
     color: #444;
     white-space: pre-wrap;
   }
+
+  .pill {
+    display: inline-block;
+    padding: 6px 10px;
+    border-radius: 999px;
+    border: 1px solid #ddd;
+    font-size: 13px;
+    margin-right: 6px;
+    background: #fafafa;
+  }
+
+  .resultRow { margin-top: 10px; line-height: 1.5; }
 
   /* OCR framing guide box */
   .ocr-guide {
@@ -80,6 +92,21 @@
 </div>
 
 <div class="card">
+  <strong>BooksRun settings</strong>
+  <div class="muted">Uses BooksRun "Average" offer for the green/red decision. Threshold is in USD.</div>
+  <input id="minUsd" type="number" value="10" min="0" step="0.5" />
+  <div class="muted">Minimum BooksRun Average (USD) to turn green if not on target list.</div>
+
+  <div style="margin-top:10px;">
+    <strong>Worker URL</strong>
+    <div class="muted">Paste your Cloudflare Worker /lookup URL here once. It will be saved on your device.</div>
+    <input id="workerUrl" type="text" placeholder="https://your-worker.workers.dev/lookup" />
+    <button type="button" id="saveWorkerUrl">Save Worker URL</button>
+    <div id="workerStatus" class="muted"></div>
+  </div>
+</div>
+
+<div class="card">
   <input id="scan" type="text" placeholder="Scan ISBN..." autocomplete="off" />
   <br><br>
 
@@ -107,13 +134,14 @@
     </div>
   </div>
 
-  <!-- Hidden file input to open camera -->
   <input id="ocrInput" type="file" accept="image/*" capture="environment" style="display:none;" />
 
   <video id="preview" playsinline></video>
   <div id="camStatus" class="muted"></div>
 
   <div id="ocrStatus" class="statusLine"></div>
+
+  <div id="decisionBox" class="resultRow"></div>
 </div>
 
 <div class="card">
@@ -121,17 +149,16 @@
   <ul id="recent"></ul>
 </div>
 
-<!-- OCR library -->
 <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
 
 <script>
-/* ===== Persistence (localStorage) ===== */
-const LS_KEY = "media_sniper_isbn13_list_v1"; // stored as newline-separated isbn13
+/* ===== Config and Persistence ===== */
+const LS_KEY = "media_sniper_isbn13_list_v1";
 const LS_TS  = "media_sniper_isbn13_list_ts_v1";
+const LS_WORKER = "media_sniper_booksrun_worker_url_v1";
 
-function setPersistStatus(msg){
-  document.getElementById("persistStatus").textContent = msg || "";
-}
+function setPersistStatus(msg){ document.getElementById("persistStatus").textContent = msg || ""; }
+function setWorkerStatus(msg){ document.getElementById("workerStatus").textContent = msg || ""; }
 
 function saveListToLocalStorage(set){
   try{
@@ -164,6 +191,19 @@ function clearSavedList(){
   setPersistStatus("Saved list cleared.");
 }
 
+function saveWorkerUrl(url){
+  try{
+    localStorage.setItem(LS_WORKER, url);
+    setWorkerStatus("Saved.");
+  } catch(_) {
+    setWorkerStatus("Could not save Worker URL.");
+  }
+}
+
+function loadWorkerUrl(){
+  try { return localStorage.getItem(LS_WORKER) || ""; } catch(_) { return ""; }
+}
+
 /* ===== App state ===== */
 let isbnSet = new Set();
 let lastScanned = null;
@@ -172,7 +212,6 @@ let lastScannedIsbn13 = null;
 let audioCtx = null;
 let soundReady = false;
 
-// OCR worker cache
 let ocrWorker = null;
 let ocrReady = false;
 
@@ -241,14 +280,14 @@ function beep(){
 }
 
 function vibrateSuccess(){
-  try {
-    if (navigator.vibrate) navigator.vibrate([100, 50, 100]);
-  } catch (_) {}
+  try { if (navigator.vibrate) navigator.vibrate([100, 50, 100]); } catch (_) {}
 }
 
-function setMatchState(isMatch){
+function setGreenState(isGreen){
   document.body.classList.remove("matchState");
-  if(isMatch) document.body.classList.add("matchState");
+  document.body.classList.remove("redHint");
+  if(isGreen) document.body.classList.add("matchState");
+  else document.body.classList.add("redHint");
 }
 
 document.getElementById("enableSound").onclick = async () => {
@@ -257,6 +296,15 @@ document.getElementById("enableSound").onclick = async () => {
   soundReady = true;
   document.getElementById("scan").focus();
 };
+
+document.getElementById("saveWorkerUrl").addEventListener("click", () => {
+  const val = (document.getElementById("workerUrl").value || "").trim();
+  if(!val.startsWith("http")) {
+    setWorkerStatus("Please paste a full https URL.");
+    return;
+  }
+  saveWorkerUrl(val);
+});
 
 document.getElementById("file").addEventListener("change", async (e) => {
   const file = e.target.files[0];
@@ -284,27 +332,120 @@ document.getElementById("clearSaved").addEventListener("click", () => {
   document.getElementById("count").textContent = "0";
 });
 
-function handleScan(value){
+function renderDecision({ isbn13, isTarget, avgUsd, booksrunStatus, booksrunMsg }) {
+  const minUsd = parseFloat(document.getElementById("minUsd").value || "10");
+  const hasAvg = (typeof avgUsd === "number") && !Number.isNaN(avgUsd);
+  const green = !!(isTarget || (hasAvg && avgUsd >= minUsd));
+
+  setGreenState(green);
+
+  if(green){
+    beep();
+    vibrateSuccess();
+  }
+
+  const decisionBox = document.getElementById("decisionBox");
+  const targetPill = `<span class="pill">Target: ${isTarget ? "YES" : "NO"}</span>`;
+  const avgPill = `<span class="pill">BooksRun Avg: ${hasAvg ? ("$" + avgUsd.toFixed(2)) : "N/A"}</span>`;
+  const statPill = `<span class="pill">BooksRun: ${booksrunStatus || "unknown"}</span>`;
+
+  const decisionText = green
+    ? `<strong>BUY</strong> (green)`
+    : `<strong>PASS</strong> (red)`;
+
+  const extra = booksrunMsg ? `<div class="muted">${escapeHtml(booksrunMsg)}</div>` : "";
+
+  decisionBox.innerHTML = `
+    ${targetPill}${avgPill}${statPill}
+    <div style="margin-top:8px;font-size:18px;">${decisionText}</div>
+    <div class="muted">ISBN-13: ${isbn13 || "-"}</div>
+    ${extra}
+  `;
+}
+
+function escapeHtml(s){
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+  }[c]));
+}
+
+async function fetchBooksRunAverage(isbn13){
+  const workerUrl = (document.getElementById("workerUrl").value || "").trim();
+  if(!workerUrl || !workerUrl.startsWith("http")) {
+    return { status: "error", message: "Missing Worker URL. Paste and Save it above.", avgUsd: null };
+  }
+
+  const url = workerUrl.includes("?")
+    ? `${workerUrl}&isbn=${encodeURIComponent(isbn13)}`
+    : `${workerUrl}?isbn=${encodeURIComponent(isbn13)}`;
+
+  try{
+    const r = await fetch(url, { method: "GET" });
+    const payload = await r.json();
+
+    // We expect payload.booksrun to be BooksRun response
+    const br = payload && payload.booksrun ? payload.booksrun : null;
+
+    // Based on your screenshot: br.result.status and br.result.text
+    const result = br && br.result ? br.result : null;
+    const status = result && result.status ? result.status : (payload.ok ? "ok" : "error");
+
+    let avg = null;
+    let msg = null;
+
+    if(result && result.status === "success"){
+      const t = result.text || {};
+      // BooksRun uses keys like "Average", "Good", "New"
+      const avgRaw = t.Average;
+      if(avgRaw != null && avgRaw !== ""){
+        const num = Number(avgRaw);
+        if(!Number.isNaN(num)) avg = num;
+      }
+      if(avg == null) msg = "BooksRun returned success but no Average price.";
+      return { status: "success", message: msg, avgUsd: avg };
+    }
+
+    // Non-success result
+    msg = (result && result.text) ? String(result.text) : "BooksRun did not return success.";
+    return { status: status || "error", message: msg, avgUsd: null };
+
+  } catch(e){
+    return { status: "error", message: "BooksRun lookup failed (network or worker).", avgUsd: null };
+  }
+}
+
+async function handleScan(value){
   const norm13 = normalizeToIsbn13(value);
 
   lastScanned = value;
   lastScannedIsbn13 = norm13;
 
-  const isMatch = !!(norm13 && isbnSet.has(norm13));
-  setMatchState(isMatch);
-
-  if(isMatch){
-    beep();
-    vibrateSuccess();
-  }
-
   const li = document.createElement("li");
-  li.textContent = value + (isMatch ? "  MATCH" : "");
+  li.textContent = value;
   const list = document.getElementById("recent");
   list.prepend(li);
   while(list.children.length > 10) list.removeChild(list.lastChild);
 
   document.getElementById("scan").value = "";
+
+  if(!norm13){
+    renderDecision({ isbn13: null, isTarget: false, avgUsd: null, booksrunStatus: "error", booksrunMsg: "Could not normalize to ISBN-13." });
+    return;
+  }
+
+  const isTarget = isbnSet.has(norm13);
+
+  // Call BooksRun
+  renderDecision({ isbn13: norm13, isTarget, avgUsd: null, booksrunStatus: "loading", booksrunMsg: "Checking BooksRun..." });
+  const br = await fetchBooksRunAverage(norm13);
+
+  renderDecision({
+    isbn13: norm13,
+    isTarget,
+    avgUsd: br.avgUsd,
+    booksrunStatus: br.status,
+    booksrunMsg: br.message
+  });
 }
 
 let timer = null;
@@ -437,7 +578,6 @@ ocrInput.addEventListener("change", async (e) => {
   try{
     await ensureOcrWorker();
 
-    // Pass 1
     setOcrStatus("OCR: reading photo (pass 1) ...");
     await ocrWorker.setParameters({
       tessedit_char_whitelist: "0123456789Xx- ISBNisbn",
@@ -450,7 +590,6 @@ ocrInput.addEventListener("change", async (e) => {
     let candidates = extractIsbnCandidates(text);
     let best = pickBestIsbn(candidates);
 
-    // Pass 2 if needed
     if(!best){
       setOcrStatus("OCR: no clear ISBN found, trying pass 2 ...");
       await ocrWorker.setParameters({
@@ -483,8 +622,8 @@ ocrInput.addEventListener("change", async (e) => {
   }
 });
 
-/* ===== Restore saved list on load ===== */
-(function restoreListOnStartup(){
+/* ===== Restore saved list + worker on load ===== */
+(function restoreOnStartup(){
   const saved = loadListFromLocalStorage();
   if(saved && saved.size){
     isbnSet = saved;
@@ -499,6 +638,14 @@ ocrInput.addEventListener("change", async (e) => {
     }
   } else {
     setPersistStatus("No saved list yet. Import your list once and it will stay on device.");
+  }
+
+  const w = loadWorkerUrl();
+  if(w){
+    document.getElementById("workerUrl").value = w;
+    setWorkerStatus("Loaded saved Worker URL.");
+  } else {
+    setWorkerStatus("Paste your Worker URL and Save it.");
   }
 })();
 </script>
