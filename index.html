@@ -1129,19 +1129,6 @@ function selectCondition(key) {
   if (cartBtn && currentIsbn) cartBtn.href = buildCartUrl(currentIsbn, key);
 }
 
-function renderConditionPicker() {
-  return `
-    <div class="condition-row">
-      ${CONDITIONS.map(c => `
-        <button
-          class="cond-btn ${c.key === selectedCondition ? 'active' : ''}"
-          data-cond="${c.key}"
-          onclick="selectCondition('${c.key}')"
-        >${c.label}</button>
-      `).join('')}
-    </div>`;
-}
-
 // =============================================
 // BOOKSRUN LOOKUP
 // =============================================
